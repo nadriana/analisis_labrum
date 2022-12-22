@@ -1,1 +1,1 @@
-# analisis_labrum
+# Análisis de desgarro del labrum acetabular
