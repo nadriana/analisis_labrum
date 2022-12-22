@@ -1,0 +1,415 @@
+---
+title: "ML"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, warning=FALSE, echo=TRUE, message=FALSE}
+
+library(dplyr)
+library(tidyr)
+library(fastDummies)
+# To build the model and run stepAIC we need MASS and CAR packages.
+library(MASS) 
+library(car)
+library(lattice) # se necesita para caret
+library(caret) # para matríz de confusión
+library(corrplot) # para matriz de correlación
+
+library(sandwich) # se necesita para party
+library(party) # para Decision Trees
+library(e1071) # para SVM
+library(class) # para KNN
+
+```
+
+
+```{r}
+df <- read.csv("base.csv", na.strings = "#N/A")
+df <- na.omit(df)
+
+dim(df)
+```
+
+
+```{r}
+# Comparar diagnósticos. Estos valores son los que se utilizarán como variable dependiente.
+
+df$diagnostico_IDEAL_1 <- ifelse(df$reloj_cir == df$reloj_IDEAL_1, 0, 1)
+df$diagnostico_SOC_1 <- ifelse(df$reloj_cir == df$reloj_SOC_1, 0, 1)
+
+df$diagnostico_IDEAL_2 <- ifelse(df$reloj_cir == df$reloj_IDEAL_2, 0, 1)
+df$diagnostico_SOC_2 <- ifelse(df$reloj_cir == df$reloj_SOC_2, 0, 1)
+
+df$diagnostico_IDEAL_3 <- ifelse(df$reloj_cir == df$reloj_IDEAL_3, 0, 1)
+df$diagnostico_SOC_3 <- ifelse(df$reloj_cir == df$reloj_SOC_3, 0, 1)
+
+df$diagnostico_IDEAL_4 <- ifelse(df$reloj_cir == df$reloj_IDEAL_4, 0, 1)
+df$diagnostico_SOC_4 <- ifelse(df$reloj_cir == df$reloj_SOC_4, 0, 1)
+
+dim(df)
+```
+
+
+
+
+
+**Con gather()**
+En esta base solo se tendría el histórico de diagnósticos correctos por radiólogo y método.
+
+Convertir las columnas de que contienen la información de los diagnósticos expresados como hora de reloj de manecillas y las columnas que se derivan de las horas, se convierten en filas y los métodos y médicos en una columna de etiquetas. También la columna de "diagnósticos" incluye todas las comparaciones entre los diagnósticos de los radiólogos y la medición con el cirujano, donde 0=correcto y 1=incorrecto.
+
+```{r}
+
+df1 <- df %>% gather(medico_metodo, 
+              diagnosticos,
+              c(starts_with("reloj"), starts_with("hora_p"), starts_with("hora_e"), starts_with("pos"), starts_with("ext"),
+                starts_with("diagnostico")) )
+
+
+df1 <- df1 %>% filter(grepl("diag", medico_metodo))
+
+head(df1)
+str(df1)
+```
+
+
+```{r}
+summary(df1)
+```
+
+```{r}
+# variables categóricas
+for (columna in 1:ncol(df1)){
+  if (class(df1[,columna]) == "character"){
+    print(paste(colnames(df1[columna]), unique(df1[columna])))
+  }
+}
+```
+
+Convertir el tipo de dato de las variables categíricas de chr a factor.
+Convertir la variable "diagnosticos a entero.
+```{r}
+df1$sexo <- as.factor(df1$sexo)
+df1$lado <- as.factor(df1$lado)
+df1$cirugia_YorN <- as.factor(df1$cirugia_YorN)
+df1$medico_metodo <- as.factor(df1$medico_metodo)
+
+df1$diagnosticos <- as.integer(df1$diagnosticos)
+
+summary(df1)
+```
+
+La columna de paciente_ID no es necesaria ya que no aporta información al ser un identificador del paciente. 
+La columna cirugia_YorN tampoco aporta información ya que el 100% de las obsecvaciones tienen el mismo valor, el cual es "yes", lo que hace sentido ya que a todos los pacientes se les operó.
+Por lo tanto, eliminar ambas columnas.
+```{r}
+df1$paciente_ID <- NULL
+df1$cirugia_YorN <- NULL
+
+str(df1)
+```
+
+
+
+
+
+Shapiro test
+H0: variable no proviene de una distribución normal. Con p-value <= 0.05 no se rechaza H0
+H1: variable proviene de una distribución normal. Con p-value > 0.05. Se rechaza H0. 
+
+```{r}
+numeric_values <- df1 %>% dplyr::select(MRI.to.Surg.days, edad)
+
+sapply(numeric_values, function(x) round(shapiro.test(x)$p.value, 2))
+
+```
+
+
+El resultado del Shapiro test nos dice que ninguna variable proviene de la distribución normal, por lo que hay que normalizar.
+
+**Matriz de correlación**
+
+````{r}
+corrplot::corrplot(cor(numeric_values), method="number", type="upper")
+```
+
+**Test de independencia de las variables categóricas**
+
+H0: dependientes. No rechaza H0 cuando p-value <= 0.05
+H1: independientes. Se rechaza H0 cuando p-value > 0.05
+
+Solo cirugia_YorN es dependiente.
+Sexo y lado son independientes entonces son prescindibles, ie, las puedo quitar. 
+Comparar con el stepAIC
+
+```{r}
+categ <- df1 %>% dplyr::select(sexo, lado, medico_metodo)
+
+sapply(categ, function(x) round(chisq.test(table(x, df1$diagnosticos))$p.value, 2))
+
+```
+
+```{r}
+# Veces que un diagnóstico es correcto o no
+table(df1$diagnosticos)
+
+cat("Proporción de 0s: ", 1 - sum(df1$diagnosticos)/nrow(df1), "\n") 
+cat("Proporción de 1s: ", sum(df1$diagnosticos)/nrow(df1))
+```
+
+La proporción de diagnósticos correctos es muy baja, siendo solo el 12% de las observaciones. Por esta razón, se agregarán observaciones para balancear la base. Simplemente se tomarán las filas donde el diagnóstico fue correcto y se duplicarán.
+
+**Tranformar la base**
+
+Normalizar y agregar observaciones donde el diagnóstifo fue correcto para balancer la base
+```{r}
+# Normalizar
+
+df1$MRI.to.Surg.days <-  scale(df1$MRI.to.Surg.days)
+df1$edad <- scale(df1$edad)
+
+```
+
+
+Agragar observaciones.
+Se triplican las observaciones correctas, de esta forma el porcentaje de diangñosticos correctso pasa de 12% a 29%.
+```{r}
+# diagnósticos correctos repetidos (se copia dos veces para tener una mayor muestra de diagnósticos correctos)
+dfcorrectos <- df1 %>% filter(diagnosticos == 0)
+
+df1 <- dplyr::bind_rows(df1, dfcorrectos, dfcorrectos)
+
+table(df1$diagnosticos)
+nrow(df1) - sum(df1$diagnosticos)
+1 - sum(df1$diagnosticos)/nrow(df1)
+```
+
+
+
+Crear variables dummies
+```{r}
+df1 <- dummy_cols(df1, remove_selected_columns = TRUE)
+
+str(df1)
+head(df1)
+```
+
+
+stepAIC
+```{r}
+fit1<- glm(diagnosticos~., data=df1, family=binomial)
+fit0 <- glm(diagnosticos~1, data=df1, family=binomial)
+
+step <- stepAIC(fit0, direction="both", scope=list(upper=fit1, lower=fit0))
+
+print("Modelo final:")
+step$formula
+```
+
+
+Modelo
+```{r}
+feature_select <- df1 %>% dplyr::select(diagnosticos,
+                                        medico_metodo_diagnostico_IDEAL_3,
+                                        medico_metodo_diagnostico_SOC_1,
+                                        medico_metodo_diagnostico_IDEAL_1,
+                                        medico_metodo_diagnostico_SOC_4,
+                                        sexo_F,
+                                        MRI.to.Surg.days,
+                                        medico_metodo_diagnostico_IDEAL_2,
+                                        lado_L)
+
+```
+
+
+Dividir aleatoriamente la base entre train y test
+```{r}
+# crear un id temporal para particionar la base
+feature_select$id <- 1:nrow(feature_select)
+
+# dividir train y test
+set.seed(2)
+train <- feature_select %>% dplyr::sample_frac(0.7)
+test <- dplyr::anti_join(feature_select, train, by = "id")
+
+# Definir X_train, Y_train, X_test y Y_test
+X_train <- train[, c(2 : (ncol(train)-1) )]
+Y_train <- train$diagnosticos
+
+X_test <- test[, c(2 : (ncol(test)-1) )]
+Y_test <- test$diagnosticos
+```
+
+
+
+Revisar proporción de diagnósticos correctos e incorrectos
+```{r}
+table(Y_train)
+cat("Proporción de 0s en train: ", 1 - sum(Y_train)/length(Y_train), "\n") 
+cat("Proporción de 1s en train: ", sum(Y_train)/length(Y_train), "\n\n")
+
+table(Y_test)
+cat("Proporción de 0s en test: ", 1 - sum(Y_test)/length(Y_test), "\n") 
+cat("Proporción de 1s en test: ", sum(Y_test)/length(Y_test))
+
+```
+
+
+
+# Regresión logística
+
+```{r}
+mod <- glm(Y_train~., data = X_train, family = binomial)
+summary(mod)
+```
+
+Predecir
+```{r}
+Y_pred <- as.numeric(predict(mod, newdata = X_test, type = "response") > 0.5)
+```
+
+Matriz de confusión
+```{r}
+confusionMatrix(as.factor(Y_pred), as.factor(Y_test), mode = "everything", positive = "0")
+```
+
+Comparando estos resultados con los obtenidos en modelo donde no se añadieron obervaciones donde el diagnóstico era correcto y la base estaba altamente desbalanceada (notebook modelo-stepAIC), en este caso el modelo predice 24 casos donde el diagnóstico es correcto (en el otro modelo se predecía solo un caso).
+El error Tipo II aumenta, al predecir 20 casos como diagnósticos correctos y el realidad el diagnóstico fue incorrecto. 
+
+
+Si se toman los features del otro modelo (notebook modelo-stepAIC) se obtiene básicamente el mismo resultado.
+
+```{r}
+feature_select_1 <- df1 %>% dplyr::select(diagnosticos,
+                                          medico_metodo_diagnostico_SOC_1, 
+                                          medico_metodo_diagnostico_IDEAL_1,
+                                          medico_metodo_diagnostico_SOC_4,
+                                          sexo_F, 
+                                          medico_metodo_diagnostico_IDEAL_3, 
+                                          MRI.to.Surg.days)
+
+
+# crear un id temporal para particionar la base
+feature_select_1$id <- 1:nrow(feature_select_1)
+
+# dividir train y test
+set.seed(2)
+train_1 <- feature_select_1 %>% dplyr::sample_frac(0.7)
+test_1 <- dplyr::anti_join(feature_select_1, train_1, by = "id")
+
+# Definir X_train, Y_train, X_test y Y_test
+X_train_1 <- train_1[, c(2 : (ncol(train_1)-1) )]
+Y_train_1 <- train_1$diagnosticos
+
+X_test_1 <- test_1[, c(2 : (ncol(test_1)-1) )]
+Y_test_1 <- test_1$diagnosticos
+
+# Modelo de regresión logística
+mod_1 <- glm(Y_train_1~., data = X_train_1, family = binomial)
+summary(mod_1)
+
+Y_pred_1 <- as.numeric(predict(mod_1, newdata = X_test_1, type = "response") > 0.5)
+
+confusionMatrix(as.factor(Y_pred_1), as.factor(Y_test_1), mode = "everything", positive = "0")
+
+```
+
+
+
+
+# Decision Tree
+
+```{r}
+train$diagnosticos <- as.factor(train$diagnosticos)
+
+tree <- ctree(diagnosticos ~ medico_metodo_diagnostico_IDEAL_3 + medico_metodo_diagnostico_SOC_1 +
+                medico_metodo_diagnostico_IDEAL_1 + medico_metodo_diagnostico_SOC_4 + 
+                sexo_F + MRI.to.Surg.days + medico_metodo_diagnostico_IDEAL_2 + 
+                lado_L,
+              data = train)
+
+plot(tree)
+
+Y_pred_tree <- predict(tree, X_test)
+
+confusionMatrix(table(as.factor(Y_pred_tree), as.factor(Y_test)), mode = "everything", positive = "0")
+```
+
+
+# SVM
+
+
+```{r}
+kernel = c("linear", "polynomial", "radial", "sigmoid")
+
+for (k in kernel){
+  print(k)
+  mod_svm <- svm(formula = diagnosticos ~ medico_metodo_diagnostico_IDEAL_3 + medico_metodo_diagnostico_SOC_1 +
+                 medico_metodo_diagnostico_IDEAL_1 + medico_metodo_diagnostico_SOC_4 + 
+                 sexo_F + MRI.to.Surg.days + medico_metodo_diagnostico_IDEAL_2 + 
+                 lado_L,
+               data = train,
+               type = 'C-classification',
+               kernel = k
+               )
+  
+  Y_pred_svm <- predict(mod_svm, test)
+  print(table(as.factor(Y_pred_svm), as.factor(Y_test)))
+  cat("-------------", "\n\n")
+  
+}
+```
+
+```{r}
+# Con kerner radial da mejores resultados
+mod_svm <- svm(formula = diagnosticos ~ medico_metodo_diagnostico_IDEAL_3 + medico_metodo_diagnostico_SOC_1 +
+                 medico_metodo_diagnostico_IDEAL_1 + medico_metodo_diagnostico_SOC_4 + 
+                 sexo_F + MRI.to.Surg.days + medico_metodo_diagnostico_IDEAL_2 + 
+                 lado_L,
+               data = train,
+               type = 'C-classification',
+               kernel = 'radial'
+               )
+
+Y_pred_svm <- predict(mod_svm, test)
+
+confusionMatrix(table(as.factor(Y_pred_svm), as.factor(Y_test)), mode = "everything", positive = "0")
+```
+
+
+
+
+
+
+# KNN
+
+```{r}
+# Probar con diferentes valores de k
+k = 1
+for (k in 1:20){
+  mod_knn <- knn(train = train, test = test, cl = train$diagnosticos, k = k)
+  print(paste("Con k=", k))
+  print(table(as.factor(mod_knn), as.factor(Y_test)))
+  #print( confusionMatrix(table(as.factor(mod_knn), as.factor(Y_test)), mode = "everything", positive = "0") )
+  cat("---------", "\n\n\n")
+}
+```
+
+
+```{r}
+# Se obtienen los mejores resultados con k = 3
+mod_knn <- knn(train = train, test = test, cl = train$diagnosticos, k = 3)
+confusionMatrix(table(as.factor(mod_knn), as.factor(Y_test)), mode = "everything", positive = "0")
+
+```
+
+**Conclusión**
+Tomando en cuenta los resultados de los modelos, con el que se obtienen mejores resultados es con KNN con k=3, ya que los TP y TN son los más altos y los errores tipo I y II son los menores.
+
+
+
+
